@@ -154,6 +154,47 @@ _TOKEN_PREFIX_RE = re.compile(
 _HIGH_ENTROPY_RE = re.compile(
     r"(?<![A-Za-z0-9_+/-])[A-Za-z0-9_+/-]{32,256}={0,2}(?![A-Za-z0-9_+/=-])"
 )
+_RELATIVE_FILE_SEGMENT_RE = re.compile(r"[A-Za-z0-9._-]+")
+_RELATIVE_DIRECTORY_SEGMENT_RE = re.compile(r"[a-z][a-z_-]{0,23}")
+_RELATIVE_FILE_EXTENSION_RE = re.compile(r"[A-Za-z0-9]{1,16}")
+_SAFE_CAMEL_SOURCE_STEM_RE = re.compile(r"(?:[A-Z][a-z]{2,}){2,8}")
+_SAFE_RELATIVE_LAYOUT_PREFIXES = (
+    ("frontend", "src", "modules"),
+    ("frontend", "src", "components"),
+    ("rpa_service",),
+    ("scripts",),
+    ("tests",),
+    ("app",),
+    ("src",),
+    ("web",),
+)
+_SAFE_SOURCE_EXTENSIONS = frozenset(
+    {
+        "c",
+        "cpp",
+        "cs",
+        "css",
+        "go",
+        "h",
+        "hpp",
+        "html",
+        "java",
+        "js",
+        "jsx",
+        "kt",
+        "php",
+        "py",
+        "pyi",
+        "rb",
+        "rs",
+        "scss",
+        "sh",
+        "swift",
+        "ts",
+        "tsx",
+        "vue",
+    }
+)
 _UUID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
     r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}"
@@ -163,7 +204,8 @@ _PHONE_RE = re.compile(
     r"\(?\d{3}\)?[ .-]\d{3}[ .-]\d{4}|1[3-9]\d{9})(?!\w)"
 )
 _PRIVATE_URL_RE = re.compile(
-    r"\bhttps?://(?P<host>\[[0-9A-Fa-f:%._-]+\]|[^/:\s?#]+)"
+    r"\bhttps?://(?:[^/\s@]+@)?"
+    r"(?P<host>\[[0-9A-Fa-f:%._-]+\]|[^/:\s?#]+)"
     r"(?::\d{1,5})?(?:/[^\s<>'\"]*)?",
     re.IGNORECASE,
 )
@@ -184,7 +226,7 @@ _WINDOWS_PATH_RE = re.compile(
     r"[^\s<>:\"|?*,;)}\]]*|\\\\[^\\/\s]+[\\/][^\s,;)}\]]+)"
 )
 _POSIX_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9:])/(?:[^/\s,;)}\]]+/)+[^/\s,;)}\]]+"
+    r"(?<![A-Za-z0-9:/])/(?:[^/\s,;)}\]]+/)+[^/\s,;)}\]]+"
 )
 _HOME_PATH_RE = re.compile(r"(?<!\w)~[\\/][^\s,;)}\]]+")
 
@@ -316,6 +358,14 @@ def _replace_private_urls(
     return _PRIVATE_URL_RE.sub(replace, text)
 
 
+def _shannon_entropy(candidate: str) -> float:
+    frequencies = Counter(candidate)
+    return -sum(
+        (count / len(candidate)) * math.log2(count / len(candidate))
+        for count in frequencies.values()
+    )
+
+
 def _looks_high_entropy(candidate: str) -> bool:
     if _UUID_RE.fullmatch(candidate) or re.fullmatch(r"[0-9A-Fa-f]+", candidate):
         return False
@@ -329,12 +379,71 @@ def _looks_high_entropy(candidate: str) -> bool:
     )
     if classes < 2:
         return False
-    frequencies = Counter(candidate)
-    entropy = -sum(
-        (count / len(candidate)) * math.log2(count / len(candidate))
-        for count in frequencies.values()
+    return _shannon_entropy(candidate) >= 4.0
+
+
+def _relative_file_character(character: str) -> bool:
+    return character.isascii() and (
+        character.isalnum() or character in {".", "_", "-", "/", "\\"}
     )
-    return entropy >= 4.0
+
+
+def _safe_relative_directories(parts: list[str]) -> bool:
+    for prefix in _SAFE_RELATIVE_LAYOUT_PREFIXES:
+        if tuple(parts[: len(prefix)]) != prefix:
+            continue
+        dynamic = parts[len(prefix) :]
+        if len(dynamic) > 2 or any(
+            len(part) > 12 or not _RELATIVE_DIRECTORY_SEGMENT_RE.fullmatch(part)
+            for part in dynamic
+        ):
+            return False
+        joined = "".join(dynamic)
+        return len(joined) < 16 or _shannon_entropy(joined) < 3.5
+    return False
+
+
+def _is_safe_relative_file_match(text: str, match: re.Match[str]) -> bool:
+    start = match.start()
+    while start > 0 and _relative_file_character(text[start - 1]):
+        start -= 1
+    end = match.end()
+    while end < len(text) and _relative_file_character(text[end]):
+        end += 1
+
+    token = text[start:end]
+    if not token or len(token) > 512 or token.startswith(("/", "\\")):
+        return False
+    if "/" in token and "\\" in token:
+        return False
+    normalized = token.replace("\\", "/")
+    parts = normalized.split("/")
+    if len(parts) < 2 or any(
+        part in {"", ".", ".."} or not _RELATIVE_FILE_SEGMENT_RE.fullmatch(part)
+        for part in parts
+    ):
+        return False
+
+    filename = parts[-1]
+    stem, separator, extension = filename.rpartition(".")
+    if (
+        not separator
+        or not stem
+        or not _RELATIVE_FILE_SEGMENT_RE.fullmatch(stem)
+        or not _RELATIVE_FILE_EXTENSION_RE.fullmatch(extension)
+    ):
+        return False
+    if not _safe_relative_directories(parts[:-1]):
+        return False
+    if (
+        len(stem) >= 32
+        or extension.casefold() not in _SAFE_SOURCE_EXTENSIONS
+        or not _SAFE_CAMEL_SOURCE_STEM_RE.fullmatch(stem)
+        or _shannon_entropy(stem) >= 4.0
+    ):
+        return False
+    extension_start = start + normalized.rfind(".")
+    return match.end() == extension_start
 
 
 def _replace_high_entropy(
@@ -342,7 +451,9 @@ def _replace_high_entropy(
 ) -> str:
     def replace(match: re.Match[str]) -> str:
         candidate = match.group(0)
-        if not _looks_high_entropy(candidate):
+        if not _looks_high_entropy(candidate) or _is_safe_relative_file_match(
+            text, match
+        ):
             return candidate
         counts[RedactionCategory.SECRET] += 1
         return _placeholder(RedactionCategory.SECRET)
@@ -422,7 +533,9 @@ def residual_categories(text: str) -> tuple[RedactionCategory, ...]:
             residual.add(RedactionCategory.PRIVATE_URL)
             break
     for match in _HIGH_ENTROPY_RE.finditer(text):
-        if _looks_high_entropy(match.group(0)):
+        if _looks_high_entropy(match.group(0)) and not _is_safe_relative_file_match(
+            text, match
+        ):
             residual.add(RedactionCategory.SECRET)
             break
     for regex in (_IPV4_CANDIDATE_RE, _IPV6_CANDIDATE_RE):

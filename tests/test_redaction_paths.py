@@ -170,6 +170,80 @@ class RedactionCoverageTests(unittest.TestCase):
         self.assertEqual(1, result.counts[RedactionCategory.CREDENTIAL])
         self.assertEqual(1, result.counts[RedactionCategory.PRIVATE_KEY])
 
+    def test_public_https_urls_are_preserved_as_action_context(self) -> None:
+        source = "https://example.com/org/repository/issues/123?view=compact#details"
+
+        result = redact_output(source)
+
+        self.assertEqual(source, result.value)
+        self.assertEqual(0, result.counts.total)
+
+    def test_safe_relative_source_paths_survive_entropy_scanning(self) -> None:
+        paths = (
+            "frontend/src/modules/jobs/JobProfileHistoryModal.vue",
+            "frontend/src/modules/jobs/JobsPage.vue",
+            "frontend/src/modules/rpa/RpaNodeManagementModal.vue",
+            "frontend/src/modules/jobs/JobProfileHistoryModal.vue:123",
+            "frontend/src/modules/jobs/JobProfileHistoryModal.vue#L123",
+        )
+        source = "\n".join(paths)
+
+        result = redact_output(source)
+
+        self.assertEqual(source, result.value)
+        self.assertEqual(0, result.counts.total)
+        self.assertEqual((), residual_categories(result.value))
+
+    def test_relative_file_exemption_does_not_hide_sensitive_values(self) -> None:
+        standalone = "aB3dE5fG7hI9jK2mN4pQ6rS8tU0vW1xYz.vue"
+        traversal = "../frontend/src/modules/jobs/JobProfileHistoryModal.vue"
+        known_token = (
+            "src/github_pat_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6/token.txt"
+        )
+
+        standalone_result = redact_output(standalone)
+        traversal_result = redact_output(traversal)
+        token_result = redact_output(known_token)
+
+        self.assertIn("[REDACTED:secret]", standalone_result.value)
+        self.assertIn("[REDACTED:filesystem_path]", traversal_result.value)
+        self.assertIn("[REDACTED:credential]", token_result.value)
+        self.assertEqual((), residual_categories(standalone_result.value))
+        self.assertEqual((), residual_categories(traversal_result.value))
+        self.assertEqual((), residual_categories(token_result.value))
+
+    def test_private_urls_with_userinfo_are_fully_redacted(self) -> None:
+        sources = (
+            "https://fixture-user:fixture-pass@service.internal/private/report",
+            "http://fixture-user:fixture-pass@10.20.30.40:8080/private/report",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                result = redact_output(source)
+                self.assertEqual("[REDACTED:private_url]", result.value)
+                self.assertEqual(1, result.counts[RedactionCategory.PRIVATE_URL])
+                self.assertEqual((), residual_categories(result.value))
+
+    def test_relative_file_exemption_rejects_entropy_bearing_segments(self) -> None:
+        secret = "aB3dE5fG7hI9jK2mN4pQ6rS8tU0vW1xYz"
+        sources = (
+            f"src/{secret}/config.py",
+            f"src/{secret}.vue",
+            f"'{secret}/nested/config.py'",
+            "src/aB3dE5fG7hI9jK2/mN4pQ6rS8tU0vW1xYz/config.py",
+            "src/a1b2c3d4e5f6g7h8/i9j0k1l2m3n4o5p6/config.py",
+            "frontend/src/modules/abcdefghijklmnop/qrstuvwxyzabcdef/Widget.vue",
+            "frontend/src/modules/jobs/aBcDeFgHiJkLmNoPqRsTuVwXyZaBcDe.vue",
+            "frontend/src/modules/jobs/QazWseDrfTgyUhjIklOpqMnb.vue",
+        )
+
+        for source in sources:
+            with self.subTest(source=source):
+                result = redact_output(source)
+                self.assertIn("[REDACTED:secret]", result.value)
+                self.assertEqual((), residual_categories(result.value))
+
     def test_session_ids_and_content_hashes_are_not_treated_as_secrets(self) -> None:
         source = (
             "session_id=123e4567-e89b-12d3-a456-426614174000 "

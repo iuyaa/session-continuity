@@ -108,7 +108,77 @@ class HandoffDocumentTests(unittest.TestCase):
         self.assertEqual([item["order"] for item in parsed.next_actions], [1, 2])
         self.assertEqual(parsed.next_actions[1]["depends_on"], ["1"])
 
-    def test_next_action_validation_rejects_order_reference_and_target_errors(self) -> None:
+    def test_next_action_targets_are_opaque_redacted_locators(self) -> None:
+        payload = copy.deepcopy(synthetic_payload())
+        payload["next_actions"][0]["targets"] = [  # type: ignore[index]
+            "src/fixture.py:123",
+            "schema:table",
+            "https://example.com/issues/123?view=compact#details",
+            "../outside.py",
+            "C:/outside.py",
+            "http://127.0.0.1:8080/private/status",
+            "https://fixture-user:fixture-pass@example.com/path",
+            "https://fixture-user:fixture-pass@service.internal/private/report",
+        ]
+
+        normalized = handoff.normalize_payload(payload)
+        self.assertEqual(
+            normalized["next_actions"][0]["targets"],
+            [
+                "src/fixture.py:123",
+                "schema:table",
+                "https://example.com/issues/123?view=compact#details",
+                "../outside.py",
+                "C:/outside.py",
+                "http://127.0.0.1:8080/private/status",
+                "https://fixture-user:fixture-pass@example.com/path",
+                "https://fixture-user:fixture-pass@service.internal/private/report",
+            ],
+        )
+
+        document, _, _ = handoff.render_document(normalized, synthetic_metadata())
+        parsed = handoff.parse_document(document)
+        self.assertEqual(
+            parsed.next_actions[0]["targets"],
+            [
+                "src/fixture.py:123",
+                "schema:table",
+                "https://example.com/issues/123?view=compact#details",
+                "../outside.py",
+                "[REDACTED:filesystem_path]",
+                "[REDACTED:private_url]",
+                "https://[REDACTED:url_userinfo]@example.com/path",
+                "[REDACTED:private_url]",
+            ],
+        )
+
+    def test_next_action_status_aliases_normalize_to_canonical_values(self) -> None:
+        aliases = {
+            "not-started": "pending",
+            "Actionable": "ready",
+            "waiting_on": "blocked",
+            "in progress": "in_progress",
+            "completed": "done",
+            "deferred": "parked",
+            "进行中": "in_progress",
+            "已完成": "done",
+        }
+
+        for supplied, expected in aliases.items():
+            with self.subTest(supplied=supplied):
+                payload = copy.deepcopy(synthetic_payload())
+                payload["next_actions"][0]["status"] = supplied  # type: ignore[index]
+                normalized = handoff.normalize_payload(payload)
+                self.assertEqual(normalized["next_actions"][0]["status"], expected)
+
+        payload = copy.deepcopy(synthetic_payload())
+        payload["next_actions"][0]["status"] = "进行中"  # type: ignore[index]
+        normalized = handoff.normalize_payload(payload)
+        document, _, _ = handoff.render_document(normalized, synthetic_metadata())
+        parsed = handoff.parse_document(document)
+        self.assertEqual(parsed.next_actions[0]["status"], "in_progress")
+
+    def test_next_action_validation_rejects_order_reference_status_and_empty_targets(self) -> None:
         cases: list[tuple[str, dict[str, object]]] = []
 
         noncontiguous = copy.deepcopy(synthetic_payload())
@@ -123,9 +193,13 @@ class HandoffDocumentTests(unittest.TestCase):
         undefined_reference["next_actions"][0]["evidence_refs"] = ["E-999"]  # type: ignore[index]
         cases.append(("undefined-reference", undefined_reference))
 
-        traversing_target = copy.deepcopy(synthetic_payload())
-        traversing_target["next_actions"][0]["targets"] = ["../outside.py"]  # type: ignore[index]
-        cases.append(("traversing-target", traversing_target))
+        empty_target = copy.deepcopy(synthetic_payload())
+        empty_target["next_actions"][0]["targets"] = ["   "]  # type: ignore[index]
+        cases.append(("empty-target", empty_target))
+
+        invalid_status = copy.deepcopy(synthetic_payload())
+        invalid_status["next_actions"][0]["status"] = "unknown-state"  # type: ignore[index]
+        cases.append(("invalid-status", invalid_status))
 
         unknown_field = copy.deepcopy(synthetic_payload())
         unknown_field["next_actions"][0]["unexpected"] = True  # type: ignore[index]
@@ -148,6 +222,13 @@ class HandoffDocumentTests(unittest.TestCase):
         self.assertEqual(digest, hashlib.sha256(body).hexdigest())
         self.assertEqual(trailer.group(1).decode("ascii"), digest)
         self.assertTrue(document.endswith(b" -->\n"))
+
+        parsed = handoff.parse_document(document)
+        report = parsed.report()
+        self.assertEqual(report["sha256"], digest)
+        self.assertEqual(report["body_sha256"], digest)
+        self.assertEqual(report["file_sha256"], hashlib.sha256(document).hexdigest())
+        self.assertNotEqual(report["body_sha256"], report["file_sha256"])
 
         tampered = document.replace(b"Synthetic continuity goal.", b"Synthetic continuity goam.", 1)
         with self.assertRaisesRegex(InvalidInputError, "hash does not match"):
@@ -192,7 +273,12 @@ class HandoffDocumentTests(unittest.TestCase):
             self.assertEqual(publication.created_local, "2026-02-03T04:05:06+05:30")
             self.assertEqual(publication.created_utc, "2026-02-02T22:35:06Z")
             self.assertEqual(publication.timezone_offset, "+0530")
-            parsed = handoff.parse_document(publication.path.read_bytes())
+            published_bytes = publication.path.read_bytes()
+            self.assertEqual(
+                publication.file_sha256,
+                hashlib.sha256(published_bytes).hexdigest(),
+            )
+            parsed = handoff.parse_document(published_bytes)
             self.assertEqual(
                 parsed.metadata["created_at_local"], publication.created_local
             )

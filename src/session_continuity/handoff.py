@@ -71,7 +71,40 @@ _CONTROL_RE = re.compile(
 _ACTION_KEYS = frozenset(
     {"order", "status", "action", "targets", "depends_on", "acceptance", "evidence_refs"}
 )
-_ACTION_STATUSES = frozenset({"pending", "ready", "blocked", "done", "parked"})
+_ACTION_STATUSES = frozenset(
+    {"pending", "ready", "blocked", "in_progress", "done", "parked"}
+)
+_ACTION_STATUS_ALIASES = {
+    "pending": "pending",
+    "not_started": "pending",
+    "planned": "pending",
+    "todo": "pending",
+    "open": "pending",
+    "待处理": "pending",
+    "未开始": "pending",
+    "ready": "ready",
+    "actionable": "ready",
+    "就绪": "ready",
+    "已就绪": "ready",
+    "blocked": "blocked",
+    "waiting": "blocked",
+    "waiting_on": "blocked",
+    "受阻": "blocked",
+    "阻塞": "blocked",
+    "in_progress": "in_progress",
+    "active": "in_progress",
+    "started": "in_progress",
+    "进行中": "in_progress",
+    "done": "done",
+    "complete": "done",
+    "completed": "done",
+    "完成": "done",
+    "已完成": "done",
+    "parked": "parked",
+    "deferred": "parked",
+    "搁置": "parked",
+    "延期": "parked",
+}
 _LIST_KEYS = (
     "verified_state",
     "reported_state",
@@ -126,6 +159,8 @@ class ParsedHandoff:
             "schema_version": SCHEMA_VERSION,
             "handoff": self.path.name if self.path else None,
             "sha256": self.sha256,
+            "body_sha256": self.sha256,
+            "file_sha256": hashlib.sha256(self.raw).hexdigest(),
             "metadata": self.metadata,
             "goal": self.sections["Goal"],
             "verified_state": _parse_list(self.sections["Verified State"]),
@@ -157,6 +192,7 @@ class Publication:
 
     path: Path
     sha256: str
+    file_sha256: str
     created_local: str
     created_utc: str
     timezone_offset: str
@@ -211,18 +247,37 @@ def _clean_list(value: Any, *, name: str, limits: Limits) -> list[str]:
     return [_clean_text(item, name=name, limits=limits) for item in value]
 
 
-def _project_relative(value: str) -> str:
+def _clean_action_status(value: Any, *, limits: Limits) -> str:
+    supplied = _clean_text(value, name="status", limits=limits)
+    key = re.sub(r"_+", "_", supplied.casefold().replace("-", "_").replace(" ", "_"))
+    status = _ACTION_STATUS_ALIASES.get(key)
+    if status is None or status not in _ACTION_STATUSES:
+        raise InvalidInputError(
+            "Next Action status is invalid; use pending, ready, blocked, "
+            "in_progress, done, or parked"
+        )
+    return status
+
+
+def _project_relative_path(value: str) -> str:
     normalized = value.replace("\\", "/")
     if ":" in normalized:
-        raise InvalidInputError("action target must not contain a drive or stream")
+        raise InvalidInputError("artifact path must not contain a drive or stream")
     candidate = PurePosixPath(normalized)
     if candidate.is_absolute() or not candidate.parts:
-        raise InvalidInputError("action target must be project-relative")
+        raise InvalidInputError("artifact path must be project-relative")
     if any(part in {"", ".", ".."} for part in candidate.parts):
-        raise InvalidInputError("action target contains traversal")
+        raise InvalidInputError("artifact path contains traversal")
     if candidate.parts[0].casefold() == ".handoffs":
-        raise InvalidInputError("action target cannot reference .handoffs")
+        raise InvalidInputError("artifact path cannot reference .handoffs")
     return candidate.as_posix()
+
+
+def _clean_targets(value: Any, *, limits: Limits) -> list[str]:
+    targets = _clean_list(value, name="targets", limits=limits)
+    if any(not target for target in targets):
+        raise InvalidInputError("Next Action targets must not contain empty values")
+    return targets
 
 
 def _clean_actions(value: Any, *, limits: Limits) -> list[dict[str, Any]]:
@@ -245,16 +300,11 @@ def _clean_actions(value: Any, *, limits: Limits) -> list[dict[str, Any]]:
         order = raw.get("order", index)
         if isinstance(order, bool) or not isinstance(order, int) or order != index:
             raise InvalidInputError("Next Action order must be contiguous from one")
-        status = _clean_text(raw.get("status", "pending"), name="status", limits=limits)
-        if status not in _ACTION_STATUSES:
-            raise InvalidInputError("Next Action status is invalid")
+        status = _clean_action_status(raw.get("status", "pending"), limits=limits)
         action = _clean_text(raw.get("action", ""), name="action", limits=limits)
         if not action:
             raise InvalidInputError("Next Action action must not be empty")
-        targets = [
-            _project_relative(item)
-            for item in _clean_list(raw.get("targets", []), name="targets", limits=limits)
-        ]
+        targets = _clean_targets(raw.get("targets", []), limits=limits)
         depends_on = _clean_list(
             raw.get("depends_on", []), name="depends_on", limits=limits
         )
@@ -470,7 +520,7 @@ def _validate_metadata(value: Any, *, limits: Limits) -> dict[str, Any]:
             raise InvalidInputError("handoff artifact metadata is invalid")
         if not isinstance(anchor["path"], str):
             raise InvalidInputError("handoff artifact metadata is invalid")
-        _project_relative(anchor["path"])
+        _project_relative_path(anchor["path"])
         for key in ("size", "mtime_ns"):
             number = anchor[key]
             if isinstance(number, bool) or not isinstance(number, int) or number < 0:
@@ -740,6 +790,7 @@ def publish_handoff(
         return Publication(
             path=path,
             sha256=digest,
+            file_sha256=hashlib.sha256(document).hexdigest(),
             created_local=local.isoformat(timespec="seconds"),
             created_utc=utc.isoformat(timespec="seconds").replace("+00:00", "Z"),
             timezone_offset=offset,

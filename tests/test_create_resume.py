@@ -20,7 +20,11 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from session_continuity import commands, handoff  # noqa: E402
-from session_continuity.contracts import FilesystemError  # noqa: E402
+from session_continuity.contracts import (  # noqa: E402
+    DomainCode,
+    FilesystemError,
+    GitError,
+)
 from session_continuity.project_facts import (  # noqa: E402
     GitFacts,
     GitStatusCounts,
@@ -57,6 +61,37 @@ def synthetic_payload() -> dict[str, object]:
         ],
         "suggested_skills": [],
     }
+
+
+def action_payload() -> dict[str, object]:
+    payload = synthetic_payload()
+    statuses = (
+        "done",
+        "parked",
+        "blocked",
+        "pending",
+        "ready",
+        "in_progress",
+        "pending",
+    )
+    payload["next_actions"] = [
+        {
+            "order": order,
+            "status": status,
+            "action": f"Conditional synthetic action {order}.",
+            "targets": [f"synthetic-target-{order}"],
+            "depends_on": [],
+            "acceptance": f"Synthetic acceptance {order}.",
+            "evidence_refs": ["E-001"],
+        }
+        for order, status in enumerate(statuses, 1)
+    ]
+    payload["artifacts"] = ["release-notes.json", "app/DESIGN.md"]
+    payload["suggested_skills"] = [
+        "run — verify runtime behavior",
+        "review-changes — review the next delta",
+    ]
+    return payload
 
 
 def git_facts(root: Path, *, branch: str | None = None) -> GitFacts:
@@ -256,6 +291,20 @@ class ResumeTests(unittest.TestCase):
             drift_kinds = {item["kind"] for item in report["drift"]}
             self.assertIn("git_branch_changed", drift_kinds)
             self.assertIn("artifact_changed", drift_kinds)
+            self.assertEqual(report["continuation"]["guidance"], "review_drift")
+            self.assertFalse(report["continuation"]["execution_authorized"])
+            self.assertEqual(
+                report["drift_scope"]["named_artifacts"],
+                {
+                    "coverage": "explicit_saved_anchors_only",
+                    "saved": 1,
+                    "checked": 1,
+                    "matched": 0,
+                    "changed": 1,
+                    "unavailable": 0,
+                    "metadata_valid": True,
+                },
+            )
             self.assertEqual(report["next_actions"][0]["action"], "Create an execution marker.")
             self.assertFalse((root / "executed.flag").exists())
             self.assertEqual(snapshot_files(root), before_resume)
@@ -284,6 +333,139 @@ class ResumeTests(unittest.TestCase):
 
             self.assertEqual(result["report"]["status"], "RESTORED")
             self.assertEqual(result["report"]["drift"], [])
+            self.assertEqual(
+                result["report"]["current_project"]["git_probe"],
+                "checked_non_repository",
+            )
+            self.assertEqual(
+                result["report"]["continuation"]["guidance"],
+                "verify_scope",
+            )
+            self.assertEqual(snapshot_files(root), before_resume)
+            self.assertFalse((root / "executed.flag").exists())
+
+    def test_legacy_v1_missing_git_fields_are_limited_not_drifted(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            current_git = git_facts(root)
+            publication = handoff.publish_handoff(
+                root,
+                synthetic_payload(),
+                focus="legacy git fixture",
+                root_mode="cwd",
+                git={"is_repository": False},
+            )
+            before_resume = snapshot_files(root)
+
+            with (
+                mock.patch.object(commands, "resolve_project_root", return_value=root),
+                mock.patch.object(commands, "collect_git_facts", return_value=current_git),
+            ):
+                result, _ = commands.resume(
+                    invocation_cwd=root,
+                    handoff_path=publication.path,
+                )
+
+            report = result["report"]
+            self.assertEqual(report["status"], "RESTORED")
+            self.assertEqual(report["drift"], [])
+            self.assertEqual(
+                report["drift_scope"]["git"]["comparison"],
+                "limited_by_saved_v1_fields",
+            )
+            self.assertEqual(
+                report["drift_scope"]["git"]["missing_saved_fields"],
+                ["head", "branch", "detached", "status"],
+            )
+            self.assertEqual(report["continuation"]["guidance"], "verify_scope")
+            self.assertEqual(snapshot_files(root), before_resume)
+
+    def test_resume_derives_concise_continuation_without_losing_full_actions(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            current_git = git_facts(root)
+            publication = handoff.publish_handoff(
+                root,
+                action_payload(),
+                focus="continuation fixture",
+                root_mode="cwd",
+                git=git_metadata(current_git),
+            )
+            before_resume = snapshot_files(root)
+
+            with (
+                mock.patch.object(commands, "resolve_project_root", return_value=root),
+                mock.patch.object(commands, "collect_git_facts", return_value=current_git),
+            ):
+                result, _ = commands.resume(
+                    invocation_cwd=root,
+                    handoff_path=publication.path,
+                )
+
+            report = result["report"]
+            continuation = report["continuation"]
+            self.assertEqual(len(report["next_actions"]), 7)
+            self.assertEqual(
+                [item["order"] for item in continuation["next_actions"]["items"]],
+                [2, 3, 4, 5, 6],
+            )
+            self.assertEqual(continuation["next_actions"]["omitted"], 1)
+            self.assertEqual(
+                [item["status"] for item in continuation["next_actions"]["items"]],
+                ["parked", "blocked", "pending", "ready", "in_progress"],
+            )
+            self.assertEqual(
+                continuation["canonical_references"]["textual"],
+                ["release-notes.json", "app/DESIGN.md"],
+            )
+            self.assertEqual(continuation["stop"], "await_explicit_user_instruction")
+            self.assertFalse(continuation["execution_authorized"])
+            self.assertEqual(report["sha256"], report["body_sha256"])
+            self.assertEqual(report["file_sha256"], publication.file_sha256)
+            self.assertEqual(snapshot_files(root), before_resume)
+
+    def test_resume_reports_unavailable_git_without_fabricated_drift(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            saved_git = git_facts(root, branch="fixture-main")
+            publication = handoff.publish_handoff(
+                root,
+                synthetic_payload(),
+                focus="git unavailable fixture",
+                root_mode="git",
+                git=git_metadata(saved_git),
+            )
+            before_resume = snapshot_files(root)
+            unavailable = GitError(
+                "Git executable is unavailable",
+                code=DomainCode.GIT_UNAVAILABLE,
+            )
+
+            with (
+                mock.patch.object(commands, "resolve_project_root", return_value=root),
+                mock.patch.object(
+                    commands,
+                    "collect_git_facts",
+                    side_effect=unavailable,
+                ),
+            ):
+                result, _ = commands.resume(
+                    invocation_cwd=root,
+                    handoff_path=publication.path,
+                )
+
+            report = result["report"]
+            self.assertEqual(report["status"], "RESTORED")
+            self.assertEqual(report["drift"], [])
+            self.assertEqual(report["current_project"]["git_probe"], "unavailable")
+            self.assertFalse(report["drift_scope"]["git"]["checked"])
+            self.assertEqual(
+                report["drift_scope"]["git"]["comparison"],
+                "not_checked_current_unavailable",
+            )
+            self.assertEqual(report["continuation"]["guidance"], "verify_scope")
             self.assertEqual(snapshot_files(root), before_resume)
             self.assertFalse((root / "executed.flag").exists())
 
@@ -319,10 +501,70 @@ class WrapperIntegrationTests(unittest.TestCase):
             self.assertTrue(response["ok"])
             self.assertEqual(response["action"], "create")
             created = Path(response["path"])
+            self.assertEqual(response["sha256"], response["body_sha256"])
+            self.assertEqual(
+                response["file_sha256"],
+                hashlib.sha256(created.read_bytes()).hexdigest(),
+            )
             self.assertEqual(created.parent, unrelated_cwd / ".handoffs")
             self.assertTrue(created.is_file())
             self.assertEqual(len(list((unrelated_cwd / ".handoffs").glob("*.md"))), 1)
             self.assertEqual(list(unrelated_cwd.rglob("__pycache__")), [])
+    def test_invalid_optional_artifacts_do_not_block_create(self) -> None:
+        with TemporaryDirectory() as directory:
+            base = Path(directory)
+            project = base / "project"
+            project.mkdir()
+            source = project / "src" / "module.py"
+            source.parent.mkdir()
+            source.write_text("value = 1\n", encoding="utf-8")
+            sensitive = project / "reports" / "192.0.2.10" / "state.txt"
+            sensitive.parent.mkdir(parents=True)
+            sensitive.write_text("synthetic state\n", encoding="utf-8")
+            outside = base / "outside.txt"
+            outside.write_text("outside\n", encoding="utf-8")
+            request = {
+                "handoff": synthetic_payload(),
+                "named_artifacts": {
+                    "valid-relative": "src/module.py",
+                    "valid-absolute": str(source),
+                    "line-reference": "src/module.py:123",
+                    "fragment-reference": "src/module.py#L123",
+                    "missing": "src/missing.py",
+                    "outside": str(outside),
+                    "sensitive-path": "reports/192.0.2.10/state.txt",
+                },
+            }
+            environment = os.environ.copy()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            completed = subprocess.run(
+                [sys.executable, "-B", str(WRAPPER), "create", "artifact fixture"],
+                cwd=project,
+                input=json.dumps(request, ensure_ascii=False),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                timeout=30,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            response = json.loads(completed.stdout)
+            self.assertTrue(response["ok"])
+            self.assertEqual(
+                response["named_artifacts"],
+                {"requested": 7, "anchored": 2, "skipped": 5},
+            )
+            created = Path(response["path"])
+            parsed = handoff.parse_document(created.read_bytes())
+            self.assertEqual(
+                {anchor["name"] for anchor in parsed.metadata["artifact_anchors"]},
+                {"valid-relative", "valid-absolute"},
+            )
+            self.assertEqual(len(list((project / ".handoffs").glob("*.md"))), 1)
+            self.assertEqual(list(project.rglob("__pycache__")), [])
 
 
 if __name__ == "__main__":
